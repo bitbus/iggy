@@ -1,9 +1,12 @@
+use crate::streaming::models::messages_batch::MessagesBatch;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::segment::Segment;
 use crate::streaming::utils::random_id;
+use iggy::compression::compression_algorithm::CompressionAlgorithm;
 use iggy::error::Error;
 use iggy::models::messages::Message;
+use iggy::utils::crypto::Encryptor;
 use std::sync::Arc;
 use tracing::{trace, warn};
 
@@ -101,16 +104,20 @@ impl Partition {
         }
 
         let end_offset = self.get_end_offset(start_offset, count);
+
+        /*
         let messages = self.try_get_messages_from_cache(start_offset, end_offset);
         if let Some(messages) = messages {
             return Ok(messages);
         }
+         */
 
-        let segments = self.filter_segments_by_offsets(start_offset, end_offset);
+        let segments = self.find_segments_within_offset(start_offset, end_offset);
+        //let segments = self.filter_segments_by_offsets(start_offset, end_offset);
         match segments.len() {
             0 => Ok(EMPTY_MESSAGES),
             1 => segments[0].get_messages(start_offset, count).await,
-            _ => Self::get_messages_from_segments(segments, start_offset, count).await,
+            _ => todo!(), //Self::get_messages_from_segments(segments, start_offset, count).await,
         }
     }
 
@@ -195,6 +202,19 @@ impl Partition {
                     || (segment.start_offset <= end_offset && segment.current_offset >= end_offset)
             })
             .collect::<Vec<&Segment>>()
+    }
+
+    fn find_segments_within_offset(&self, start_offset: u64, end_offset: u64) -> Vec<&Segment> {
+        let slice_start = self
+            .segments
+            .iter()
+            .rposition(|segment| segment.start_offset <= start_offset)
+            .unwrap_or(0);
+
+        self.segments[slice_start..]
+            .iter()
+            .filter(|segment| segment.current_offset <= end_offset)
+            .collect()
     }
 
     async fn get_messages_from_segments(
@@ -319,7 +339,12 @@ impl Partition {
         messages
     }
 
-    pub async fn append_messages(&mut self, mut messages: Vec<Message>) -> Result<(), Error> {
+    pub async fn append_messages(
+        &mut self,
+        compression_algorithm: CompressionAlgorithm,
+        encryptor: &Option<Box<dyn Encryptor>>,
+        mut messages: Vec<Message>,
+    ) -> Result<(), Error> {
         {
             let last_segment = self.segments.last_mut().ok_or(Error::SegmentNotFound)?;
 
@@ -356,24 +381,49 @@ impl Partition {
         }
 
         let messages_count = messages.len() as u32;
+        let begin_offset = if self.current_offset == 0 {
+            0
+        } else {
+            self.current_offset + 1
+        };
+
+        // lets keep it like that for now, in the future when producer side compression
+        // is implemented will change this to offset_delta (u32 instead of u64)
+        let mut curr_offset = begin_offset;
         for message in &mut messages {
-            if self.should_increment_offset {
-                self.current_offset += 1;
-            } else {
-                self.should_increment_offset = true;
-            }
-            message.offset = self.current_offset;
+            message.offset = curr_offset;
+            curr_offset += 1;
         }
 
+        let last_offset = curr_offset - 1;
+        if self.should_increment_offset {
+            self.current_offset += last_offset;
+        } else {
+            self.should_increment_offset = true;
+            self.current_offset += last_offset;
+        }
+        let last_offset_delta = (last_offset - begin_offset) as u32;
+
+        //batching compress
+        let batch =
+            MessagesBatch::messages_to_batch(begin_offset, last_offset_delta as u32, messages);
+        {
+            let last_segment = self.segments.last_mut().ok_or(Error::SegmentNotFound)?;
+            last_segment.append_messages(batch, last_offset).await?;
+        }
+        /*
         let messages = messages.into_iter().map(Arc::new).collect::<Vec<_>>();
         {
             let last_segment = self.segments.last_mut().ok_or(Error::SegmentNotFound)?;
             last_segment.append_messages(&messages).await?;
         }
+        */
 
+        /*
         if let Some(cache) = &mut self.cache {
             cache.extend(messages);
         }
+         */
 
         self.unsaved_messages_count += messages_count;
         {
@@ -411,7 +461,10 @@ mod tests {
         let mut partition = create_partition(false);
         let messages = create_messages();
         let messages_count = messages.len() as u32;
-        partition.append_messages(messages).await.unwrap();
+        partition
+            .append_messages(CompressionAlgorithm::None, &None, messages)
+            .await
+            .unwrap();
 
         let loaded_messages = partition
             .get_messages_by_offset(0, messages_count)
@@ -426,7 +479,10 @@ mod tests {
         let messages = create_messages();
         let messages_count = messages.len() as u32;
         let unique_messages_count = 3;
-        partition.append_messages(messages).await.unwrap();
+        partition
+            .append_messages(CompressionAlgorithm::None, &None, messages)
+            .await
+            .unwrap();
 
         let loaded_messages = partition
             .get_messages_by_offset(0, messages_count)

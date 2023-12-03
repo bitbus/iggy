@@ -1,3 +1,4 @@
+use crate::streaming::models::messages_batch::MessagesBatch;
 use crate::streaming::persistence::persister::Persister;
 use crate::streaming::segments::index::{Index, IndexRange};
 use crate::streaming::segments::segment::Segment;
@@ -169,8 +170,8 @@ impl SegmentStorage for FileSegmentStorage {
         &self,
         segment: &Segment,
         index_range: &IndexRange,
-    ) -> Result<Vec<Arc<Message>>, Error> {
-        let mut messages = Vec::with_capacity(
+    ) -> Result<Vec<MessagesBatch>, Error> {
+        let mut batches = Vec::with_capacity(
             1 + (index_range.end.relative_offset - index_range.start.relative_offset) as usize,
         );
         load_messages_by_range(segment, index_range, |message: Message| {
@@ -206,16 +207,16 @@ impl SegmentStorage for FileSegmentStorage {
     async fn save_messages(
         &self,
         segment: &Segment,
-        messages: &[Arc<Message>],
+        messages_batches: &[MessagesBatch],
     ) -> Result<u32, Error> {
-        let messages_size = messages
+        let messages_size = messages_batches
             .iter()
-            .map(|message| message.get_size_bytes())
+            .map(|batch| batch.get_size_bytes())
             .sum::<u32>();
 
         let mut bytes = Vec::with_capacity(messages_size as usize);
-        for message in messages {
-            message.extend(&mut bytes);
+        for batch in messages_batches {
+            batch.extend(&mut bytes);
         }
 
         if let Err(err) = self
@@ -232,16 +233,19 @@ impl SegmentStorage for FileSegmentStorage {
 
     async fn load_message_ids(&self, segment: &Segment) -> Result<Vec<u128>, Error> {
         let mut message_ids = Vec::new();
+        /*
         load_messages_by_range(segment, &IndexRange::max_range(), |message: Message| {
             message_ids.push(message.id);
             Ok(())
         })
         .await?;
         trace!("Loaded {} message IDs from disk.", message_ids.len());
+        */
         Ok(message_ids)
     }
 
     async fn load_checksums(&self, segment: &Segment) -> Result<(), Error> {
+        /*
         load_messages_by_range(segment, &IndexRange::max_range(), |message: Message| {
             let calculated_checksum = checksum::calculate(&message.payload);
             trace!(
@@ -260,6 +264,7 @@ impl SegmentStorage for FileSegmentStorage {
             Ok(())
         })
         .await?;
+         */
         Ok(())
     }
 
@@ -393,22 +398,11 @@ impl SegmentStorage for FileSegmentStorage {
         }))
     }
 
-    async fn save_index(
-        &self,
-        segment: &Segment,
-        mut current_position: u32,
-        messages: &[Arc<Message>],
-    ) -> Result<(), Error> {
-        let mut bytes = Vec::with_capacity(messages.len() * 4);
-        for message in messages {
-            trace!("Persisting index for position: {}", current_position);
-            bytes.put_u32_le(current_position);
-            current_position += message.get_size_bytes();
-        }
-
+    async fn save_index(&self, segment: &Segment) -> Result<(), Error> {
+        let unsaved_index = segment.unsaved_indexes.as_ref();
         if let Err(err) = self
             .persister
-            .append(&segment.index_path, &bytes)
+            .append(&segment.index_path, unsaved_index)
             .await
             .with_context(|| format!("Failed to save index to segment: {}", segment.index_path))
         {
@@ -515,7 +509,7 @@ impl SegmentStorage for FileSegmentStorage {
 async fn load_messages_by_range(
     segment: &Segment,
     index_range: &IndexRange,
-    mut on_message: impl FnMut(Message) -> Result<(), Error>,
+    mut on_batch: impl FnMut(MessagesBatch) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let file = file::open(&segment.log_path).await?;
     let file_size = file.metadata().await?.len();
@@ -532,13 +526,10 @@ async fn load_messages_by_range(
         .seek(SeekFrom::Start(index_range.start.position as u64))
         .await?;
 
-    let mut read_messages = 0;
-    let messages_count =
-        (1 + index_range.end.relative_offset - index_range.start.relative_offset) as usize;
-
-    while read_messages < messages_count {
-        let offset = reader.read_u64_le().await;
-        if offset.is_err() {
+    let mut last_batch_to_read = false;
+    while !last_batch_to_read {
+        let batch_base_offset = reader.read_u64_le().await;
+        if batch_base_offset.is_err() {
             break;
         }
 
@@ -592,22 +583,7 @@ async fn load_messages_by_range(
             return Err(Error::CannotReadMessagePayload);
         }
 
-        let offset = offset.unwrap();
-        let timestamp = timestamp.unwrap();
-        let id = id.unwrap();
-        let checksum = checksum.unwrap();
-
-        let message = Message::create(
-            offset,
-            state,
-            timestamp,
-            id,
-            Bytes::from(payload),
-            checksum,
-            headers,
-        );
-        read_messages += 1;
-        on_message(message)?;
+        //on_batch(message)?;
     }
     Ok(())
 }

@@ -11,7 +11,7 @@ use crate::error::Error;
 
 // for now only those, in the future will add snappy, lz4, zstd (same as in confluent kafka) in addition to that
 // we should consider brotli as well.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum CompressionAlgorithm {
     None,
     Gzip,
